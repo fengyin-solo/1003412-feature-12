@@ -5,7 +5,9 @@ export type EntryRow = {
   status: string
   pending: boolean
   abnormal: boolean
-  [field: string]: string | number | boolean
+  // 乐观锁版本：每次落盘 +1，并发的两个班次凭版本号决定谁能落地。
+  version?: number
+  [field: string]: string | number | boolean | undefined
 }
 
 export type ModuleMeta = {

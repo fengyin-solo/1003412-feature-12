@@ -24,6 +24,22 @@
       </span>
     </p>
 
+    <div class="owner-bar">
+      <span class="owner-label">当前登录账号：</span>
+      <select
+        class="owner-select"
+        :value="identityKey"
+        @change="switchAccount(($event.target as HTMLSelectElement).value)"
+      >
+        <option v-for="account in presetAccounts" :key="account.operator" :value="account.operator">
+          {{ account.operator }}（{{ account.stationLocation || '无固定站点' }} · {{ account.shiftLabel }}）
+        </option>
+      </select>
+      <span class="owner-hint">
+        归属权限按「站点位置 + 值守人员」判定：本站值守人员可升级检查/关闭站点/安排换岗，跨站账号只读，越权操作会返回拒绝原因。
+      </span>
+    </div>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -37,6 +53,7 @@
       <thead>
         <tr>
           <th v-for="column in columns" :key="column">{{ column }}</th>
+          <th>归属</th>
           <th>当前状态</th>
           <th>可执行动作</th>
         </tr>
@@ -44,12 +61,17 @@
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
-          <td>{{ row.status }}</td>
+          <td>
+            <span v-if="ownsRow(row)" class="owner-badge mine">本站值守</span>
+            <span v-else class="owner-badge other">跨站只读</span>
+          </td>
+          <td>{{ row.status }}<span class="version-tag">v{{ Number(row.version ?? 0) }}</span></td>
           <td class="row-actions">
             <button
               v-for="action in actions"
               :key="action"
               class="link"
+              :class="{ disabled: !ownsRow(row) }"
               type="button"
               @click="runAction(action, row)"
             >
@@ -58,7 +80,7 @@
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 2" class="empty-state">暂无防火检查站数据，可先登记防火检查站</td>
+          <td :colspan="columns.length + 3" class="empty-state">暂无防火检查站数据，可先登记防火检查站</td>
         </tr>
       </tbody>
     </table>
@@ -66,6 +88,7 @@
     <footer class="page-foot">
       <span>共 {{ total }} 条防火检查站记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span v-else-if="successMessage" class="success-text">{{ successMessage }}</span>
     </footer>
   </section>
 </template>
@@ -74,30 +97,63 @@
 import { computed, onMounted, ref } from 'vue'
 
 import {
-  downloadEntries,
-  listEntries,
-  moduleMeta,
-  runAction as applyAction,
-} from '@/api/local-service'
+  checkpointStatusSummary,
+  ownsStation,
+  submitCheckpointAction,
+  type OperatorIdentity,
+} from '@/api/checkpoint-service'
+import { downloadEntries, listEntries, moduleMeta } from '@/api/local-service'
+import { PRESET_ACCOUNTS, useSessionStore } from '@/stores/session'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('checkpoint')
-const columns = ["站点编号", "站点位置", "值守人员", "检查项目", "通行车辆数", "收缴火种数", "值班日期", "运行状态"]
+const session = useSessionStore()
+const presetAccounts = PRESET_ACCOUNTS
+const columns = ["站点编号", "站点位置", "值守人员", "原值守人员", "检查项目", "通行车辆数", "收缴火种数", "值班日期", "运行状态"]
 const actions = ["升级检查", "关闭站点", "安排换岗"]
-const statuses = ["正常检查", "临时关闭", "升级检查", "等待换岗"]
-const stats = [{"label": "站点总数", "value": 0}, {"label": "正常检查数", "value": 0}, {"label": "收缴火种数", "value": 0}]
 
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const successMessage = ref('')
 const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
-const statusSummary = computed(() =>
-  statuses.map((status: string) => ({
-    status,
-    count: rows.value.filter((row) => String(row.status) === status).length,
-  })),
-)
+const filterFields = ["站点编号", "站点位置", "值守人员"]
+
+const identity = computed<OperatorIdentity>(() => ({
+  operator: session.operator,
+  stationLocation: session.stationLocation,
+  shiftLabel: session.shiftLabel,
+}))
+
+// select 的 value 用姓名即可（演示账号姓名唯一）。
+const identityKey = computed(() => session.operator)
+
+function switchAccount(operator: string) {
+  const account = presetAccounts.find((item) => item.operator === operator)
+  if (account) {
+    session.switchAccount(account)
+    errorMessage.value = ''
+    successMessage.value = ''
+    reload()
+  }
+}
+
+function ownsRow(row: EntryRow): boolean {
+  return ownsStation(row, identity.value)
+}
+
+const statusSummary = computed(() => checkpointStatusSummary(rows.value))
+
+const stats = computed(() => {
+  const totalCount = rows.value.length
+  const normalCount = rows.value.filter((row) => String(row.status) === '正常检查').length
+  const seized = rows.value.reduce((sum, row) => sum + (Number(row['收缴火种数']) || 0), 0)
+  return [
+    { label: '站点总数', value: totalCount },
+    { label: '正常检查数', value: normalCount },
+    { label: '收缴火种数', value: seized },
+  ]
+})
 
 function resetFilters() {
   filters.value = {}
@@ -114,16 +170,19 @@ function openCreate() {
 
 function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
-  const result = applyAction(meta.key, Number(row.id), action)
+  successMessage.value = ''
+  // 携带渲染时版本号：若另一班次已抢先落地，本次提交会被乐观锁拒绝。
+  const result = submitCheckpointAction(Number(row.id), action, identity.value, Number(row.version ?? 0))
   if (!result.ok) {
     errorMessage.value = result.message
+    reload()
     return
   }
+  successMessage.value = result.message
   reload()
 }
 
 function reload() {
-  errorMessage.value = ''
   try {
     const payload = listEntries(meta.key, filters.value)
     rows.value = payload.items
@@ -135,3 +194,69 @@ function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.owner-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #d8dee6);
+  border-radius: 8px;
+  background: #f7f9fc;
+}
+
+.owner-label {
+  font-weight: 600;
+}
+
+.owner-select {
+  min-width: 320px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color, #d8dee6);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.owner-hint {
+  color: #6b7480;
+  font-size: 12px;
+}
+
+.owner-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.owner-badge.mine {
+  background: #e4f6ea;
+  color: #1d7a3e;
+}
+
+.owner-badge.other {
+  background: #f0f1f3;
+  color: #7a828c;
+}
+
+.link.disabled {
+  opacity: 0.45;
+}
+
+.version-tag {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: #eef1f5;
+  color: #8a93a0;
+  font-size: 11px;
+}
+
+.success-text {
+  color: #1d7a3e;
+}
+</style>

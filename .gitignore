@@ -20,7 +20,7 @@ pip-wheel-metadata/
 dist/
 build/
 out/
-target/
+.verify-dist/
 **/target/
 .gradle/
 classes/
